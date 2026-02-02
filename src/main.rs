@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -8,6 +9,8 @@ use crossterm::{
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, PartialEq)]
 enum TokenType {
@@ -44,6 +47,7 @@ enum Language {
     Rust,
     Python,
     JavaScript,
+    Java,
     C,
     Bash,
     Plain,
@@ -55,6 +59,7 @@ impl Language {
             "rs" => Language::Rust,
             "py" => Language::Python,
             "js" | "jsx" | "ts" | "tsx" => Language::JavaScript,
+            "java" => Language::Java,
             "c" | "h" | "cpp" | "hpp" | "cc" => Language::C,
             "sh" | "bash" => Language::Bash,
             _ => Language::Plain,
@@ -81,6 +86,15 @@ impl Language {
                 "finally", "throw", "async", "await", "import", "export", "from", "default",
                 "switch", "case", "typeof", "instanceof", "delete", "void", "yield",
             ],
+            Language::Java => &[
+                "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+                "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+                "finally", "float", "for", "goto", "if", "implements", "import", "instanceof",
+                "int", "interface", "long", "native", "new", "package", "private", "protected",
+                "public", "return", "short", "static", "strictfp", "super", "switch", "synchronized",
+                "this", "throw", "throws", "transient", "try", "void", "volatile", "while",
+                "true", "false", "null",
+            ],
             Language::C => &[
                 "int", "char", "float", "double", "void", "struct", "union", "enum", "if",
                 "else", "for", "while", "do", "break", "continue", "return", "switch", "case",
@@ -102,6 +116,10 @@ impl Language {
                 "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
                 "usize", "f32", "f64", "bool", "char", "str", "String", "Vec", "Option", "Result",
                 "Box", "Rc", "Arc", "Cell", "RefCell",
+            ],
+            Language::Java => &[
+                "byte", "short", "int", "long", "float", "double", "boolean", "char", "String",
+                "Integer", "Double", "List", "ArrayList", "Map", "HashMap", "Set", "HashSet",
             ],
             Language::C => &["int", "char", "float", "double", "void", "size_t", "uint8_t", "uint16_t", "uint32_t"],
             _ => &[],
@@ -206,7 +224,7 @@ impl SyntaxHighlighter {
 
     fn is_comment_start(&self, ch: char, next: Option<char>) -> bool {
         match self.language {
-            Language::Rust | Language::C | Language::JavaScript => {
+            Language::Rust | Language::C | Language::JavaScript | Language::Java => {
                 ch == '/' && (next == Some('/') || next == Some('*'))
             }
             Language::Python | Language::Bash => ch == '#',
@@ -422,7 +440,8 @@ struct Pane {
     modified: bool,
     search_query: String,
     last_search_pos: Option<(usize, usize)>,
-    highlighter: SyntaxHighlighter, // Add this
+    highlighter: SyntaxHighlighter,
+    selection_start: Option<(usize, usize)>,
 }
 
 impl Pane {
@@ -437,9 +456,13 @@ impl Pane {
         modified: false,
         search_query: String::new(),
         last_search_pos: None,
-        highlighter: SyntaxHighlighter::new(Language::Plain), // Add this
+        highlighter: SyntaxHighlighter {
+            language: Language::Plain,
+        },
+        selection_start: None,
     }
-}
+    }
+
 
     fn execute_command(&mut self, command: EditCommand) {
         command.redo(&mut self.buffer);
@@ -482,31 +505,33 @@ enum SplitMode {
 struct Editor {
     panes: Vec<Pane>,
     active_pane: usize,
-    split_mode: SplitMode,
     should_quit: bool,
-    needs_full_redraw: bool,
     mode: EditorMode,
-    input_buffer: String,
     message: Option<String>,
+    input_buffer: String,
+    quit_warning_shown: bool,
+    needs_full_redraw: bool,
+    split_mode: SplitMode,
     show_line_numbers: bool,
-    quit_warning_shown: bool, // Add this line
+    clipboard: Option<Clipboard>,
 }
 
 impl Editor {
     fn new() -> Self {
-    Self {
-        panes: vec![Pane::new()],
-        active_pane: 0,
-        split_mode: SplitMode::None,
-        should_quit: false,
-        needs_full_redraw: true,
-        mode: EditorMode::Normal,
-        input_buffer: String::new(),
-        message: None,
-        show_line_numbers: true,
-        quit_warning_shown: false, // Add this line
+        Self {
+            panes: vec![Pane::new()],
+            active_pane: 0,
+            should_quit: false,
+            mode: EditorMode::Normal,
+            message: None,
+            input_buffer: String::new(),
+            quit_warning_shown: false,
+            needs_full_redraw: true,
+            split_mode: SplitMode::None,
+            show_line_numbers: true,
+            clipboard: Clipboard::new().ok(),
+        }
     }
-}
 
     fn active_pane(&self) -> &Pane {
         &self.panes[self.active_pane]
@@ -843,21 +868,40 @@ impl Editor {
         }
 
         if file_row < pane.buffer.line_count() {
-    if let Some(line) = pane.buffer.get_line(file_row) {
-        let display_line = if line.len() > text_width as usize {
-            &line[..text_width as usize]
-        } else {
-            line
-        };
+            if let Some(line) = pane.buffer.get_line(file_row) {
+                let display_line = if line.len() > text_width as usize {
+                    &line[..text_width as usize]
+                } else {
+                    line
+                };
 
-        if !pane.search_query.is_empty() && line.contains(&pane.search_query) {
-            self.draw_line_with_highlight(stdout, display_line, &pane.search_query)?;
-        } else {
-            // Use syntax highlighting
-            self.draw_line_with_syntax(stdout, display_line, &pane.highlighter)?;
-        }
-    }
-} else if !self.show_line_numbers {
+                let selection_range = if let Some(start_pos) = pane.selection_start {
+                    let end_pos = (pane.cursor.y, pane.cursor.x);
+                    let (start, end) = if start_pos < end_pos { (start_pos, end_pos) } else { (end_pos, start_pos) };
+                    
+                    if file_row > start.0 && file_row < end.0 {
+                         Some((0, line.len()))
+                    } else if file_row == start.0 && file_row == end.0 {
+                         Some((start.1, end.1))
+                    } else if file_row == start.0 {
+                         Some((start.1, line.len()))
+                    } else if file_row == end.0 {
+                         Some((0, end.1))
+                    } else {
+                         None
+                    }
+                } else {
+                    None
+                };
+
+                if !pane.search_query.is_empty() && line.contains(&pane.search_query) {
+                    self.draw_line_with_highlight(stdout, display_line, &pane.search_query)?;
+                } else {
+                    // Use syntax highlighting
+                    self.draw_line_with_syntax(stdout, display_line, &pane.highlighter, selection_range)?;
+                }
+            }
+        } else if !self.show_line_numbers {
             queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
             queue!(stdout, Print("~"))?;
             queue!(stdout, ResetColor)?;
@@ -870,24 +914,40 @@ impl Editor {
 }
 
     fn draw_line_with_syntax(
-    &self,
-    stdout: &mut io::Stdout,
-    line: &str,
-    highlighter: &SyntaxHighlighter,
-) -> io::Result<()> {
-    let tokens = highlighter.highlight_line(line);
-    
-    for (text, token_type) in tokens {
-        queue!(
-            stdout,
-            SetForegroundColor(token_type.color()),
-            Print(text),
-            ResetColor
-        )?;
+        &self,
+        stdout: &mut io::Stdout,
+        line: &str,
+        highlighter: &SyntaxHighlighter,
+        selection_range: Option<(usize, usize)>,
+    ) -> io::Result<()> {
+        let tokens = highlighter.highlight_line(line);
+        
+        if let Some((sel_start, sel_end)) = selection_range {
+             let mut current_col = 0;
+             for (text, token_type) in tokens {
+                let color = token_type.color();
+                for ch in text.chars() {
+                    let is_selected = current_col >= sel_start && current_col < sel_end;
+                    if is_selected {
+                        queue!(stdout, SetBackgroundColor(Color::DarkGrey))?;
+                    }
+                    queue!(stdout, SetForegroundColor(color), Print(ch), ResetColor)?;
+                    current_col += 1;
+                }
+             }
+        } else {
+            for (text, token_type) in tokens {
+                queue!(
+                    stdout,
+                    SetForegroundColor(token_type.color()),
+                    Print(text),
+                    ResetColor
+                )?;
+            }
+        }
+        
+        Ok(())
     }
-    
-    Ok(())
-}
 
     fn draw_current_line(
     &self,
@@ -924,7 +984,7 @@ impl Editor {
         if !pane.search_query.is_empty() && line.contains(&pane.search_query) {
             self.draw_line_with_highlight(stdout, display_line, &pane.search_query)?;
         } else {
-            self.draw_line_with_syntax(stdout, display_line, &pane.highlighter)?;
+            self.draw_line_with_syntax(stdout, display_line, &pane.highlighter, None)?;
         }
     }
     queue!(stdout, terminal::Clear(ClearType::UntilNewLine))?;
@@ -1087,6 +1147,8 @@ impl Editor {
         Ok(())
     }
 
+
+
     fn process_normal_mode(&mut self, key_event: KeyEvent) -> io::Result<()> {
         match key_event {
             KeyEvent {
@@ -1158,33 +1220,22 @@ impl Editor {
                 self.needs_full_redraw = true;
             }
             KeyEvent {
-                code: KeyCode::Char('y'),
+                code: KeyCode::Char('c'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.active_pane_mut().redo();
-                self.needs_full_redraw = true;
-            }
-            KeyEvent {
-                code: KeyCode::Char('\\'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.split_horizontal();
-            }
-            KeyEvent {
-                code: KeyCode::Char('/'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.split_vertical();
-            }
-            KeyEvent {
-                code: KeyCode::Char('w'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.next_pane();
+                // Copy current line
+                let line_content = {
+                    let pane = self.active_pane();
+                    pane.buffer.get_line(pane.cursor.y).cloned()
+                };
+
+                if let Some(line) = line_content {
+                     if let Some(clipboard) = &mut self.clipboard {
+                        let _ = clipboard.set_text(line);
+                        self.message = Some("Line copied to clipboard".to_string());
+                    }
+                }
             }
             KeyEvent {
                 code: KeyCode::Char('x'),
@@ -1194,11 +1245,36 @@ impl Editor {
                 self.close_split();
             }
             KeyEvent {
-                code: KeyCode::Char('l'),
+                code: KeyCode::Char('v'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.toggle_line_numbers();
+                // Paste
+                if let Some(clipboard) = &mut self.clipboard {
+                    if let Ok(text) = clipboard.get_text() {
+                         let pane = self.active_pane_mut();
+                         for ch in text.chars() {
+                            if ch == '\n' {
+                                let command = EditCommand::InsertNewline {
+                                    row: pane.cursor.y,
+                                    col: pane.cursor.x,
+                                };
+                                pane.execute_command(command);
+                                pane.cursor.y += 1;
+                                pane.cursor.x = 0;
+                            } else if ch != '\r' {
+                                let command = EditCommand::InsertChar {
+                                    row: pane.cursor.y,
+                                    col: pane.cursor.x,
+                                    ch,
+                                };
+                                pane.execute_command(command);
+                                pane.cursor.x += 1;
+                            }
+                         }
+                         self.needs_full_redraw = true;
+                    }
+                }
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -1222,6 +1298,13 @@ impl Editor {
                 let (_, height) = terminal::size()?;
                 let visible_lines = self.calculate_visible_lines(height);
                 let pane = self.active_pane_mut();
+                
+                // Auto-indentation logic
+                let current_row = pane.cursor.y;
+                let current_line = pane.buffer.get_line(current_row).cloned().unwrap_or_default();
+                let indent: String = current_line.chars().take_while(|c| c.is_whitespace()).collect();
+                let should_indent = current_line.trim_end().ends_with('{');
+                
                 let command = EditCommand::InsertNewline {
                     row: pane.cursor.y,
                     col: pane.cursor.x,
@@ -1229,9 +1312,34 @@ impl Editor {
                 pane.execute_command(command);
                 pane.cursor.y += 1;
                 pane.cursor.x = 0;
+                
+                // Apply indentation
+                for c in indent.chars() {
+                    let command = EditCommand::InsertChar {
+                        row: pane.cursor.y,
+                        col: pane.cursor.x,
+                        ch: c,
+                    };
+                    pane.execute_command(command);
+                    pane.cursor.x += 1;
+                }
+                
+                // Add extra indentation if needed
+                if should_indent {
+                    for _ in 0..4 {
+                         let command = EditCommand::InsertChar {
+                            row: pane.cursor.y,
+                            col: pane.cursor.x,
+                            ch: ' ',
+                        };
+                        pane.execute_command(command);
+                        pane.cursor.x += 1;
+                    }
+                }
+
                 pane.adjust_scroll(visible_lines);
                 self.message = None;
-                self.needs_full_redraw = true; // Add this line
+                self.needs_full_redraw = true;
             }
             KeyEvent {
                 code: KeyCode::Backspace,
