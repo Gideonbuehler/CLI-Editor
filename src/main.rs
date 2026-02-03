@@ -744,7 +744,7 @@ impl Editor {
         queue!(stdout, cursor::Hide)?;
 
         if self.needs_full_redraw {
-            queue!(stdout, terminal::Clear(ClearType::All))?;
+            // queue!(stdout, terminal::Clear(ClearType::All))?;  <-- REMOVED
 
             match self.split_mode {
                 SplitMode::None => {
@@ -908,7 +908,23 @@ impl Editor {
             queue!(stdout, ResetColor)?;
         }
 
-        queue!(stdout, terminal::Clear(ClearType::UntilNewLine))?;
+        let mut used_width = line_num_width;
+        if file_row < pane.buffer.line_count() {
+             if let Some(line) = pane.buffer.get_line(file_row) {
+                 if line.len() > text_width as usize {
+                     used_width += text_width as usize;
+                 } else {
+                     used_width += line.len();
+                 }
+             }
+        } else if !self.show_line_numbers {
+             used_width += 1;
+        }
+
+        let remaining = width as usize - used_width;
+        if remaining > 0 {
+             queue!(stdout, Print(" ".repeat(remaining)))?;
+        }
     }
 
     Ok(())
@@ -988,7 +1004,23 @@ impl Editor {
             self.draw_line_with_syntax(stdout, display_line, &pane.highlighter, None)?;
         }
     }
-    queue!(stdout, terminal::Clear(ClearType::UntilNewLine))?;
+    
+    // Fill remaining space with spaces instead of clearing to end of line
+    // ensuring we don't wipe out the right pane in vertical split mode
+    let current_x = line_num_width + if let Some(line) = pane.buffer.get_line(pane.cursor.y) {
+        if line.len() > text_width as usize {
+            text_width as usize
+        } else {
+            line.len()
+        }
+    } else {
+        0
+    };
+    
+    let remaining = width.saturating_sub(current_x as u16);
+    if remaining > 0 {
+        queue!(stdout, Print(" ".repeat(remaining as usize)))?;
+    }
 
     Ok(())
 }
@@ -1068,7 +1100,7 @@ impl Editor {
                 } else {
                     queue!(
                         stdout,
-                        Print("^Q:Quit ^S:Save ^O:Open ^F:Search ^N:Next ^Z:Undo ^Y:Redo ^H:HSplit ^V:VSplit ^W:NextPane ^X:CloseSplit ^L:LineNum")
+                        Print("^Q:Quit ^S:Save ^O:Open ^F:Search ^N:Next ^Z:Undo ^Y:Redo ^H:HSplit ^K:VSplit ^W:NextPane ^X:CloseSplit ^L:LineNum")
                     )?;
                 }
             }
@@ -1134,16 +1166,22 @@ impl Editor {
     fn process_keypress(&mut self) -> io::Result<()> {
         let event = event::read()?;
 
-        if let Event::Key(key_event) = event {
-            if key_event.kind == KeyEventKind::Press {
-                match self.mode {
-                    EditorMode::Normal => self.process_normal_mode(key_event)?,
-                    EditorMode::Search => self.process_search_mode(key_event)?,
-                    EditorMode::SavePrompt => self.process_save_prompt(key_event)?,
-                    EditorMode::OpenPrompt => self.process_open_prompt(key_event)?,
-                    EditorMode::GotoLinePrompt => self.process_goto_line_prompt(key_event)?,
+        match event {
+            Event::Key(key_event) => {
+                if key_event.kind == KeyEventKind::Press {
+                    match self.mode {
+                        EditorMode::Normal => self.process_normal_mode(key_event)?,
+                        EditorMode::Search => self.process_search_mode(key_event)?,
+                        EditorMode::SavePrompt => self.process_save_prompt(key_event)?,
+                        EditorMode::OpenPrompt => self.process_open_prompt(key_event)?,
+                        EditorMode::GotoLinePrompt => self.process_goto_line_prompt(key_event)?,
+                    }
                 }
             }
+            Event::Resize(_, _) => {
+                self.needs_full_redraw = true;
+            }
+            _ => {}
         }
 
         Ok(())
@@ -1222,6 +1260,42 @@ impl Editor {
                 ..
             } => {
                 self.find_next();
+            }
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.toggle_line_numbers();
+            }
+            KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.next_pane();
+            }
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.split_horizontal();
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.split_vertical();
+            }
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.active_pane_mut().redo();
+                self.needs_full_redraw = true;
             }
             KeyEvent {
                 code: KeyCode::Char('z'),
