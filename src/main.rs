@@ -427,6 +427,7 @@ enum EditorMode {
     Search,
     SavePrompt,
     OpenPrompt,
+    GotoLinePrompt,
 }
 
 #[derive(Clone)]
@@ -1071,7 +1072,7 @@ impl Editor {
                     )?;
                 }
             }
-            EditorMode::Search | EditorMode::SavePrompt | EditorMode::OpenPrompt => {
+            EditorMode::Search | EditorMode::SavePrompt | EditorMode::OpenPrompt | EditorMode::GotoLinePrompt => {
                 if let Some(msg) = &self.message {
                     queue!(stdout, Print(format!("{}{}", msg, self.input_buffer)))?;
                 }
@@ -1117,7 +1118,7 @@ impl Editor {
                     cursor::Show
                 )?;
             }
-            EditorMode::Search | EditorMode::SavePrompt | EditorMode::OpenPrompt => {
+            EditorMode::Search | EditorMode::SavePrompt | EditorMode::OpenPrompt | EditorMode::GotoLinePrompt => {
                 let prompt_len = self.message.as_ref().map(|m| m.len()).unwrap_or(0);
                 queue!(
                     stdout,
@@ -1140,6 +1141,7 @@ impl Editor {
                     EditorMode::Search => self.process_search_mode(key_event)?,
                     EditorMode::SavePrompt => self.process_save_prompt(key_event)?,
                     EditorMode::OpenPrompt => self.process_open_prompt(key_event)?,
+                    EditorMode::GotoLinePrompt => self.process_goto_line_prompt(key_event)?,
                 }
             }
         }
@@ -1203,6 +1205,16 @@ impl Editor {
                 ..
             } => {
                 self.start_search();
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.mode = EditorMode::GotoLinePrompt;
+                self.input_buffer.clear();
+                self.message = Some("Go to line: ".to_string());
+                self.needs_full_redraw = true;
             }
             KeyEvent {
                 code: KeyCode::Char('n'),
@@ -1560,6 +1572,60 @@ impl Editor {
             }
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn process_goto_line_prompt(&mut self, key_event: KeyEvent) -> io::Result<()> {
+        match key_event.code {
+            KeyCode::Enter => {
+                if !self.input_buffer.is_empty() {
+                     if let Ok(line_num) = self.input_buffer.parse::<usize>() {
+                         let target = line_num.saturating_sub(1);
+                         let (_, height) = terminal::size()?;
+                         let visible_lines = self.calculate_visible_lines(height);
+                         
+                         let mut success = false;
+                         let mut out_of_range = false;
+
+                         {
+                             let pane = self.active_pane_mut();
+                             if target < pane.buffer.line_count() {
+                                 pane.cursor.y = target;
+                                 pane.cursor.x = 0;
+                                 pane.adjust_scroll(visible_lines);
+                                 success = true;
+                             } else {
+                                 out_of_range = true;
+                             }
+                         }
+
+                         if success {
+                             self.message = Some(format!("Went to line {}", line_num));
+                         } else if out_of_range {
+                             self.message = Some("Line number out of range".to_string());
+                         }
+                     } else {
+                         self.message = Some("Invalid line number".to_string());
+                     }
+                }
+                self.mode = EditorMode::Normal;
+                self.needs_full_redraw = true;
+            }
+            KeyCode::Esc => {
+                self.mode = EditorMode::Normal;
+                self.message = Some("Goto line cancelled".to_string());
+                self.needs_full_redraw = true;
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                if c.is_numeric() {
+                    self.input_buffer.push(c);
+                }
             }
             _ => {}
         }
